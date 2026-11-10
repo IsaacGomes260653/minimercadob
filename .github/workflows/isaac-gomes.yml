@@ -120,3 +120,112 @@ jobs:
       # O -q (quiet) só imprime se der erro: log sem mensagens + verde = build OK.
       - name: Build com compileall
         run: python tasks.py build
+
+  # ===========================================================================
+  # LAB BUILD + TRIVY + RELEASE (Integração DevOps, aula prática)
+  # Fluxo completo:  lint ---> test ---> build ---> imagem
+  #                                                 (Build -> Trivy -> Release)
+  # ---------------------------------------------------------------------------
+  # Por que um job só, com vários steps? Jobs rodam em runners diferentes e
+  # não compartilham a imagem local. No MESMO job, a imagem construída fica no
+  # Docker do runner: o Trivy analisa e o push envia EXATAMENTE a mesma
+  # referência (mesmo nome:tag), sem reconstruir nada depois do scan.
+  # ===========================================================================
+  imagem:
+    # needs: só começa se a CI anterior inteira (lint -> test -> build) passar.
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # Actions novas fixadas pelo SHA do commit (a tag fica no comentário):
+      # uma tag pode ser movida para outro código; um SHA não.
+      - name: Baixar código
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Define UMA vez a referência usada por Build, Trivy e Release.
+      # Formato: USUARIO/devops-market:<branch>-<sha7>
+      #   ex.: usuario/devops-market:feature-47-testes-nome-cliente-a1b2c3d
+      # A "/" da branch vira "-" (tag Docker não aceita "/"). O sha7 liga a
+      # imagem ao commit que a gerou. Não usamos "latest" (não é rastreável).
+      - name: Definir referência da imagem
+        env:
+          # Variable (valor público): vars.NOME. Não é segredo.
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+        run: |
+          if [ -z "$DOCKERHUB_USERNAME" ]; then
+            echo "::error::Variable DOCKERHUB_USERNAME não cadastrada no repositório."
+            exit 1
+          fi
+          BRANCH="${GITHUB_REF_NAME//\//-}"
+          IMAGE="${DOCKERHUB_USERNAME}/devops-market:${BRANCH}-${GITHUB_SHA::7}"
+          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+          echo "Referência da imagem: ${IMAGE}"
+
+      # BUILD: só constrói a imagem no runner. NÃO publica nada.
+      #   -f Dockerfile = caminho do Dockerfile (está na raiz do projeto)
+      #   -t $IMAGE     = nome:tag da imagem construída
+      #   .             = contexto do build (raiz; o .dockerignore filtra)
+      # As labels OCI gravam na imagem o commit e o repositório de origem.
+      - name: Build da imagem Docker
+        run: |
+          docker build \
+            -f Dockerfile \
+            -t "$IMAGE" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            .
+          docker image ls "$IMAGE"
+
+      # TRIVY (relatório informativo): mostra TODAS as HIGH/CRITICAL, inclusive
+      # as que ainda não têm correção. exit-code 0 porque este passo só
+      # registra a evidência; quem decide é o security gate logo abaixo.
+      - name: Trivy - relatório completo (informativo)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: "0"
+          format: table
+
+      # TRIVY (SECURITY GATE): a política que reprova a pipeline.
+      #   severity HIGH,CRITICAL = só essas severidades contam para bloquear
+      #   ignore-unfixed true    = bloqueia quando já existe versão corrigida
+      #                            (há o que fazer: atualizar base/dependência).
+      #                            As sem correção aparecem no relatório acima
+      #                            e são tratadas por risco (slide 34).
+      #   exit-code 1            = achou algo da política: o step FALHA e os
+      #                            steps de Release abaixo NÃO executam.
+      - name: Trivy - security gate (HIGH/CRITICAL com correção)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+          # O Trivy já foi instalado no passo anterior.
+          skip-setup-trivy: true
+
+      # RELEASE: login + push, só quando TUDO abaixo é verdadeiro:
+      #   success()                -> Build e Trivy passaram (gate aprovou)
+      #   event_name == 'push'     -> evento confiável (PR nunca publica)
+      #   ref == branch do aluno   -> só a branch autorizada publica
+      #   repository_owner         -> só no meu fork, onde estão MEUS secrets
+      - name: Autenticar no Docker Hub
+        if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/feature/47-testes-nome-cliente' && github.repository_owner == 'IsaacGomes260653' }}
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          # Usuário vem de Variable; token vem de Secret (nunca no código).
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Publica a MESMA referência que o Trivy aprovou (nenhum rebuild).
+      # O digest impresso no fim identifica o conteúdo publicado.
+      - name: Publicar no Docker Hub
+        if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/feature/47-testes-nome-cliente' && github.repository_owner == 'IsaacGomes260653' }}
+        run: |
+          docker push "$IMAGE"
+          echo "Publicado: ${IMAGE}"
+          echo "Digest: $(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE")"
