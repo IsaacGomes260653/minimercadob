@@ -9,6 +9,11 @@ RUN python -m compileall -q app scripts tasks.py
 
 FROM python:3.12-slim
 
+# CVE-2026-85091: a base ainda traz o zlib1g vulnerável; aplica a correção do Debian
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends --only-upgrade zlib1g \
+ && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 ENV PORT=3000
 ENV DATABASE_URL=sqlite:///data/devops_market.db
